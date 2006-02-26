@@ -1,0 +1,53 @@
+#!/usr/bin/env ruby
+
+class Change
+    attr_accessor :author, :time, :description
+
+    def initialize
+        @description = ""
+    end
+
+    def print_change
+        puts "#{@time} #{@author}"
+        @description.each_line do |s|
+            puts "\t" + s
+        end
+    end
+end
+
+changes = []
+
+IO.popen("svn log .") do |io|
+
+    current_change = nil
+
+    io.each_line do |s|
+
+        s = s.chomp
+
+        if s =~ /^-+$/
+            # start of a new change
+
+            if current_change != nil
+                changes.push(current_change)
+            end
+            current_change = Change.new
+        elsif current_change.author == nil
+            # first line of new change
+
+            fields = s.split(/ \| /)
+            current_change.author = fields[1]
+
+            # time
+            timebits = fields[2].split(/\s+/)
+            current_change.time = timebits[0] + " " + timebits[1]
+        else
+            current_change.description += s + "\n"
+        end
+    end
+end
+
+changes.each do |change|
+    change.print_change
+end
+
