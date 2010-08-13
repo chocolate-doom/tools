@@ -1,0 +1,340 @@
+#!/usr/bin/env ruby
+
+require "json"
+
+class ZClass
+	attr_reader :name
+	attr_accessor :fields
+	attr_accessor :methods
+
+	def initialize(name)
+		@name = name
+		@fields = {}
+		@methods = {}
+	end
+end
+
+class ZField
+	attr_reader :name, :type
+
+	def initialize(name, type)
+		@name = name
+		@type = type
+	end
+end
+
+# In the given string, replace text matching the given regexp with
+# whitespace.
+
+def blank_re(re, text)
+	text.gsub(re) do |match|
+		$~[0].gsub(/(\S+)/) do
+			" " * $1.length
+		end
+	end
+end
+
+def strip_comments(text)
+	text = blank_re(/\/\/.*?\n/, text)
+	text = blank_re(/\/\*.*?\*\//m, text)
+
+	# Strip preprocessor as well.
+
+	text = blank_re(/\#[^\n]*\n/, text)
+
+	# Also these:
+
+	text = blank_re(/(public|protected|private):/, text)
+
+	text
+end
+
+def scan_ignore_comments(re, text)
+	text = strip_comments(text)
+
+	text.scan(re) do |match|
+		yield $~
+	end
+end
+
+def find_block_end(text, start_offset)
+	depth = 0
+
+	scan_ignore_comments(/([\{\}])/, text[start_offset, text.length]) do |match|
+		if match[1] == "{"
+			depth += 1
+		else
+			depth -= 1
+		end
+
+		if depth == 0
+			return start_offset + match.pre_match.length
+		end
+	end
+
+	raise "Failed to find function end"
+end
+
+# Iterate over each method or function in the specified text.
+
+def gsub_functions(text)
+	last_function_end = 0
+
+	result = text
+	adjust = 0
+
+	scan_ignore_comments(/((\w+)::)?(\w+)\s*\(([^\)]*?)\)\s*\{/m, text) do |match|
+		offset = match.pre_match.length
+
+		if offset > last_function_end
+			class_name = match[2]
+			name = match[3]
+			end_offset = find_block_end(text, offset) + 1
+
+			block = text[offset, end_offset - offset]
+
+			# Get replacement text.
+
+			replacement = yield class_name, name, block
+
+			# Substitute old text for new text:
+
+			before_text = result[0, offset + adjust]
+			after_text = result[end_offset + adjust,
+			                    result.length]
+			result = before_text + replacement + after_text
+			adjust += replacement.length - block.length
+
+			# Save end position of function so that we won't
+			# change anything in this block again.
+
+			last_function_end = end_offset
+		end
+	end
+
+	result
+end
+
+# Iterate over each field and method definition in the specified class
+# body.
+
+def each_field(text)
+	last_field_end = 0
+
+	scan_ignore_comments(/([\{\;])/, text) do |match|
+		offset = match.pre_match.length
+
+		#puts "#{offset} <=> #{last_field_end}"
+		next if offset < last_field_end
+
+		if match[1] == "{"
+			block_end = find_block_end(text, offset)
+
+			field_text = text[last_field_end, block_end - last_field_end]
+
+			yield strip_comments(field_text)
+
+			last_field_end = block_end + 1
+		else
+			field_text = text[last_field_end, offset-last_field_end]
+
+			if field_text =~ /\S/m
+				yield strip_comments(field_text)
+			end
+
+			last_field_end = offset + 1
+		end
+	end
+end
+
+# Iterate over each class in the specified text.
+
+def each_class(text)
+	scan_ignore_comments(/(struct|class)\s+(\w+)[^\{\;]*?\{/m, text) do |match|
+
+		offset = match.pre_match.length
+		block_start = offset + match[0].length
+
+		name = match[2]
+		end_offset = find_block_end(text, offset)
+		body = text[block_start, end_offset - block_start]
+
+		yield name, body
+	end
+end
+
+def parse_field(text)
+	# Field or method?
+
+	if text =~ /(\w+)\s*\(/
+		return [ :method, $1 ]
+	elsif text !~ /\{/
+		# Split into subfields and identify names.
+
+		text = text.sub(/(\w+)/, "")
+		field_type = $1
+
+		subfields = text.split(/,/)
+
+		result = [ :field, field_type, [] ]
+
+		for subfield in subfields
+			if subfield =~ /(\w+)/
+				result[2].push($1)
+			end
+		end
+
+		return result
+	else
+		return nil
+	end
+end
+
+def parse_classes(text)
+
+	classes = {}
+
+	each_class(text) do |name, body|
+		
+		zclass = ZClass.new(name)
+		classes[name] = zclass
+
+		each_field(body) do |field_data|
+			data = parse_field(field_data)
+
+			if data == nil
+				# ...
+			elsif data[0] == :method
+				zclass.methods[data[1]] = true
+			elsif data[0] == :field
+				for field_name in data[2]
+					field = ZField.new(field_name, data[1])
+					zclass.fields[field_name] = field
+				end
+			end
+		end
+	end
+	
+	classes
+end
+
+def identify_class_for_method(method_name, classes)
+	result = nil
+
+	classes.each_pair do |class_name, zclass|
+		zclass.methods.each_pair do |mname, method|
+			if mname != method_name
+				# ...
+			elsif result == nil
+				result = class_name
+			else
+				return nil # Ambiguous.
+			end
+		end
+	end
+
+	result
+end
+
+def transform_method_calls(body, zclass, classes)
+	body = body.gsub(/((\.|\-\>)\s*)?(\w+)(\s*)\((\s*)/) do
+		deref_type = $2
+		method_name = $3
+		outer_space = $4
+		inner_space = $5
+
+		method_class = identify_class_for_method(method_name, classes)
+
+		if method_class == nil
+			method_class = "????"
+		end
+
+		if deref_type == "."
+			# Can't transform actual method calls.
+			". /* METHOD */ #{method_class}__#{method_name}" +
+			"(#{inner_space}&????, "
+		elsif deref_type == "->"
+			# Can't transform actual method calls.
+			"-> /* METHOD */ #{method_class}__#{method_name}" +
+			"(#{inner_space}????, "
+		elsif zclass.methods.has_key? method_name
+			# Can transform implicit method calls.
+			"#{zclass.name}__#{method_name}(#{inner_space}self, "
+		else
+			# Global function? No change.
+			"#{method_name}#{outer_space}(#{inner_space}"
+		end
+	end
+end
+
+# Transform a method body to C.
+
+def transform_method_body(body, zclass, name, classes)
+
+	# Transform the method definition first.
+
+	body = body.sub(/#{zclass.name}\s*::\s*#{name}\s*\(\s*/,
+	                "#{zclass.name}__#{name}(#{zclass.name} *self, ")
+
+	# Fields must have self-> preceding them.
+
+	zclass.fields.each_pair do |fname, field|
+		body = body.gsub(/\b#{fname}\b/, "self->#{fname}")
+	end
+
+	# Method calls
+
+	body = transform_method_calls(body, zclass, classes)
+
+	# Use "self" instead of "this".
+
+	body = body.gsub(/\bthis\b/, "self")
+
+	# Clean up left-over spurious commas.
+
+	body = body.gsub(/self,\s*\)/, "self)")
+	body = body.gsub(/\?\?\?\?,\s*\)/, "????)")
+
+	body
+end
+
+def dump_class_info(classes)
+	classes.each_pair do |name, zclass|
+		puts name
+		puts "\tfields:"
+		zclass.fields.each_pair do |fname, field|
+			puts "\t\t#{field.type} #{fname}"
+		end
+		puts "\tmethods:"
+		zclass.methods.each_key do |mname|
+			puts "\t\t#{mname}"
+		end
+	end
+end
+
+header = File.readlines(ARGV[1]).join
+
+classes = parse_classes(header)
+
+#dump_class_info(classes)
+
+data = File.readlines(ARGV[0]).join
+
+transformed = gsub_functions(data) do |class_name, name, body|
+#	puts "#{class_name}, #{name}:"
+
+	zclass = classes[class_name]
+
+	if zclass != nil
+		body = transform_method_body(body, zclass, name, classes)
+	end
+
+#	puts "=" * 40
+#	puts body
+#	puts "=" * 40
+
+	body
+end
+
+puts transformed
+
